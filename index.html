@@ -224,7 +224,7 @@ function toast(msg, ms=3500){ const t=$("#toast"); t.textContent=msg; t.classLis
 async function getClient(space){
   const tok = store.get("nvg_hf");
   const key = space + (tok||"");
-  if (!clients[key]) clients[key] = Client.connect(space, tok ? { token: tok } : {});
+  if (!clients[key]) clients[key] = Client.connect(space, tok ? { token: tok, events: ["data","status"] } : { events: ["data","status"] });
   try { return await clients[key]; } catch(e){ delete clients[key]; throw e; }
 }
 function findUrl(d){
@@ -252,57 +252,78 @@ async function runSpace(space, endpoint, payload, onStatus){
 }
 async function urlToBlob(u){ const r = await fetch(u); if(!r.ok) throw new Error("download "+r.status); return await r.blob(); }
 
-async function pollinationsImage(prompt, ratio){
+// Pollinations free tier: ~1 image / 45s per IP — we queue & wait automatically
+let polNext = 0;
+async function pollinationsImage(prompt, ratio, st){
   const { w, h } = dims(ratio);
-  for (let a=0; a<3; a++){
+  for (let a=0; a<5; a++){
+    const wait = polNext - Date.now();
+    if (wait > 0){
+      for (let s=Math.ceil(wait/1000); s>0; s--){ st?.(`🎨 फ्री इमेज लिमिट: ${s} सेकंड में अगली इमेज…`); await new Promise(r=>setTimeout(r,1000)); }
+    }
+    st?.("🎨 Pollinations AI इमेज बना रहा है…");
     const seed = Math.floor(Math.random()*1e9);
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w*2}&height=${h*2}&nologo=true&seed=${seed}&model=flux`;
     try{
       const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 120000);
       const r = await fetch(url, { signal: ctrl.signal }); clearTimeout(t);
+      polNext = Date.now() + 46000;
       if (r.ok){ const b = await r.blob(); if (b.size > 2000 && b.type.startsWith("image")) return b; }
-    }catch{}
-    await new Promise(r=>setTimeout(r,2500));
+      else {
+        const txt = await r.text().catch(()=> "");
+        const m = txt.match(/Retry after (\d+)\s*s/i);
+        polNext = Date.now() + (m ? (+m[1]+2)*1000 : 46000);
+      }
+    }catch{ polNext = Date.now() + 5000; }
   }
-  throw new Error("AI इमेज सर्वर व्यस्त है");
+  throw new Error("AI इमेज सर्वर व्यस्त है, थोड़ी देर बाद कोशिश करें");
 }
 
-// engines: return { blob?, url }
+// ZeroGPU quota tracking (shared by all HF models for one user/IP)
+let gpuOutUntil = 0;
+function noteQuota(msg){
+  const m = msg.match(/Try again in (\d+):(\d+):(\d+)/);
+  const secs = m ? (+m[1]*3600 + +m[2]*60 + +m[3]) : 600;
+  gpuOutUntil = Date.now() + Math.max(secs, 300)*1000;
+}
+
+// engines: j = { prompt, image, ratio, dur } (j.image cached if AI image generated); return { blob?, url }
 const ENGINES = {
-  async ltx({ prompt, image, ratio, dur }, st){
-    const { w, h } = dims(ratio);
-    const isImg = !!image;
+  async ltx(j, st){
+    const { w, h } = dims(j.ratio);
+    const isImg = !!j.image;
+    st("🎬 LTX-Video GPU पर बना रहा है…");
     const u = await runSpace(MODELS.ltx.space, isImg ? "/image_to_video" : "/text_to_video", {
-      prompt, negative_prompt: NEG, input_image_filepath: isImg ? handle_file(image) : null, input_video_filepath: null,
-      height_ui: h, width_ui: w, mode: isImg ? "image-to-video" : "text-to-video", duration_ui: dur,
+      prompt: j.prompt, negative_prompt: NEG, input_image_filepath: isImg ? handle_file(j.image) : null, input_video_filepath: null,
+      height_ui: h, width_ui: w, mode: isImg ? "image-to-video" : "text-to-video", duration_ui: j.dur,
       ui_frames_to_use: 9, seed_ui: 42, randomize_seed: true, ui_guidance_scale: 1, improve_texture_flag: true
     }, st);
     return { url: u };
   },
-  async wan22({ prompt, image, ratio, dur }, st){
-    if (!image){ st("🎨 पहले AI इमेज बन रही है…"); image = await pollinationsImage(prompt, ratio); }
+  async wan22(j, st){
+    if (!j.image) j.image = await pollinationsImage(j.prompt, j.ratio, st);
     st("🎬 Wan 2.2 वीडियो बना रहा है…");
     const u = await runSpace(MODELS.wan22.space, "/generate_video", {
-      input_image: handle_file(image), prompt, steps: 6, negative_prompt: NEG, duration_seconds: dur,
+      input_image: handle_file(j.image), prompt: j.prompt, steps: 6, negative_prompt: NEG, duration_seconds: j.dur,
       guidance_scale: 1, guidance_scale_2: 1, seed: 42, randomize_seed: true
     }, st);
     return { url: u };
   },
-  async wan21({ prompt, image, ratio, dur }, st){
-    const { w, h } = dims(ratio);
-    if (!image){ st("🎨 पहले AI इमेज बन रही है…"); image = await pollinationsImage(prompt, ratio); }
+  async wan21(j, st){
+    const { w, h } = dims(j.ratio);
+    if (!j.image) j.image = await pollinationsImage(j.prompt, j.ratio, st);
     st("🎬 Wan 2.1 वीडियो बना रहा है…");
     const u = await runSpace(MODELS.wan21.space, "/generate_video", {
-      input_image: handle_file(image), prompt, height: h, width: w, negative_prompt: NEG,
-      duration_seconds: Math.min(dur, 3.4), guidance_scale: 1, steps: 4, seed: 42, randomize_seed: true
+      input_image: handle_file(j.image), prompt: j.prompt, height: h, width: w, negative_prompt: NEG,
+      duration_seconds: Math.min(j.dur, 3.4), guidance_scale: 1, steps: 4, seed: 42, randomize_seed: true
     }, st);
     return { url: u };
   },
-  async motion({ prompt, image, ratio, dur }, st){
-    if (!image){ st("🎨 Pollinations AI इमेज बना रहा है…"); image = await pollinationsImage(prompt, ratio); }
-    st("🎥 सिनेमैटिक मोशन रिकॉर्ड हो रहा है…");
-    const img = await blobToImg(image);
-    const blob = await recordCanvas({ ratio, duration: dur, draw: (t)=>drawKenBurns(img, t/dur, Math.floor(Math.random()*4)) });
+  async motion(j, st){
+    if (!j.image) j.image = await pollinationsImage(j.prompt, j.ratio, st);
+    st("🎥 सिनेमैटिक मोशन रिकॉर्ड हो रहा है… (टैब खुला रखें)");
+    const img = await blobToImg(j.image), k = Math.floor(Math.random()*4);
+    const blob = await recordCanvas({ ratio: j.ratio, duration: j.dur, draw: (t)=>drawKenBurns(img, t/j.dur, k) });
     return { blob };
   }
 };
@@ -465,19 +486,21 @@ async function generateOne({ prompt, image, ratio, dur, model }){
   items.push(it); render();
   const t0 = Date.now(); const tick = setInterval(()=>{ it.elapsed = Math.round((Date.now()-t0)/1000); render(); }, 1000);
   const order = model==="auto" ? AUTO_ORDER[image?"image":"text"] : [model];
+  const j = { prompt, image, ratio, dur };
   let lastErr;
   try{
     for (const m of order){
+      if (MODELS[m].space && model==="auto" && Date.now() < gpuOutUntil) continue;
       it.modelName = MODELS[m].name; it.msg = `${MODELS[m].name} से बन रहा है…`; render();
       try{
-        const r = await ENGINES[m]({ prompt, image, ratio, dur }, (s)=>{ it.msg = s; render(); });
+        const r = await ENGINES[m](j, (s)=>{ it.msg = s; render(); });
         Object.assign(it, r, { status: "done", msg: "", usedModel: m });
         if (r.url){ try{ it.blob = await urlToBlob(r.url); }catch{} }
         return it;
       }catch(e){
         lastErr = e; const msg = String(e?.message||e);
         console.warn(m, msg);
-        if (/quota|GPU/i.test(msg) && m!=="motion") toast(`${MODELS[m].name}: फ्री GPU कोटा खत्म/व्यस्त — अगला मॉडल आज़मा रहे हैं`);
+        if (/quota/i.test(msg)){ noteQuota(msg); if (model==="auto") toast("फ्री GPU कोटा खत्म — अब Pollinations + Motion से बना रहे हैं (Settings में free HF टोकन डालकर ज़्यादा कोटा पाएं)", 6000); }
       }
     }
     throw lastErr || new Error("असफल");
